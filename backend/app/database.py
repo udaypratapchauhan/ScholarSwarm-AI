@@ -177,27 +177,32 @@ def create_session(
     session_id: str,
     status: str = "pending",
     student_profile: Optional[Dict[str, Any]] = None,
+    completed_at: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create a new session record."""
+    """Create a new session record. Automatically sets completed_at if status is completed/failed."""
     conn = get_connection(db_path)
     now_str = datetime.now(timezone.utc).isoformat()
+    final_completed = completed_at
+    if final_completed is None and status in ("completed", "failed"):
+        final_completed = now_str
+
     profile_json = json.dumps(student_profile) if student_profile else None
     try:
         with conn:
             conn.execute(
                 """
-                INSERT INTO sessions (session_id, status, student_profile, created_at)
-                VALUES (?, ?, ?, ?);
+                INSERT INTO sessions (session_id, status, student_profile, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?);
                 """,
-                (session_id, status, profile_json, now_str),
+                (session_id, status, profile_json, now_str, final_completed),
             )
         return {
             "session_id": session_id,
             "status": status,
             "student_profile": student_profile,
             "created_at": now_str,
-            "completed_at": None,
+            "completed_at": final_completed,
         }
     finally:
         conn.close()
@@ -244,6 +249,28 @@ def update_session_status(
         conn.close()
 
 
+def update_session_profile(
+    session_id: str,
+    student_profile: Dict[str, Any],
+    db_path: Optional[str] = None,
+) -> None:
+    """Update session student profile JSON."""
+    conn = get_connection(db_path)
+    profile_json = json.dumps(student_profile)
+    try:
+        with conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET student_profile = ?
+                WHERE session_id = ?;
+                """,
+                (profile_json, session_id),
+            )
+    finally:
+        conn.close()
+
+
 # ============================================================================
 # Pipeline Events Operations
 # ============================================================================
@@ -285,19 +312,34 @@ def record_pipeline_event(
 
 def get_pipeline_events(
     session_id: str,
+    since_id: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve all pipeline events for a session in chronological order."""
+    """Retrieve pipeline events for a session, optionally filtered after since_id."""
     conn = get_connection(db_path)
     try:
-        cursor = conn.execute(
-            """
-            SELECT * FROM pipeline_events
-            WHERE session_id = ?
-            ORDER BY created_at ASC;
-            """,
-            (session_id,),
-        )
+        if since_id:
+            cursor = conn.execute(
+                """
+                SELECT * FROM pipeline_events
+                WHERE session_id = ?
+                  AND rowid > (
+                      SELECT rowid FROM pipeline_events
+                      WHERE event_id = ? AND session_id = ?
+                  )
+                ORDER BY rowid ASC;
+                """,
+                (session_id, since_id, session_id),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT * FROM pipeline_events
+                WHERE session_id = ?
+                ORDER BY rowid ASC;
+                """,
+                (session_id,),
+            )
         events = []
         for row in cursor.fetchall():
             events.append({
@@ -310,5 +352,74 @@ def get_pipeline_events(
                 "created_at": row["created_at"],
             })
         return events
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# Pipeline Errors Operations
+# ============================================================================
+
+def record_pipeline_error(
+    error_id: str,
+    session_id: str,
+    agent: str,
+    error_type: str,
+    message: str,
+    recoverable: bool = False,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persist a structured error record for diagnostics."""
+    conn = get_connection(db_path)
+    now_str = datetime.now(timezone.utc).isoformat()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO pipeline_errors (error_id, session_id, agent, error_type, message, recoverable, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (error_id, session_id, agent, error_type, message, 1 if recoverable else 0, now_str),
+            )
+        return {
+            "error_id": error_id,
+            "session_id": session_id,
+            "agent": agent,
+            "error_type": error_type,
+            "message": message,
+            "recoverable": recoverable,
+            "created_at": now_str,
+        }
+    finally:
+        conn.close()
+
+
+def get_pipeline_errors(
+    session_id: str,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve all logged pipeline errors for a session."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            SELECT * FROM pipeline_errors
+            WHERE session_id = ?
+            ORDER BY rowid ASC;
+            """,
+            (session_id,),
+        )
+        errors = []
+        for row in cursor.fetchall():
+            errors.append({
+                "error_id": row["error_id"],
+                "session_id": row["session_id"],
+                "agent": row["agent"],
+                "error_type": row["error_type"],
+                "message": row["message"],
+                "recoverable": bool(row["recoverable"]),
+                "created_at": row["created_at"],
+            })
+        return errors
     finally:
         conn.close()
