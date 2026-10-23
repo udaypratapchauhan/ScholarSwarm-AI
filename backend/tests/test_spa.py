@@ -71,14 +71,24 @@ def test_extract_cgpa_with_explicit_scale():
     assert warnings == []
 
 
-def test_extract_cgpa_omits_unscaled_values_with_warning():
-    """Safeguard: Never assume 4.0 or any scale when unstated."""
+def test_extract_cgpa_preserves_unscaled_value_with_unknown_scale():
+    """Safeguard: Never assume 4.0 or 10.0 when unstated; preserve raw float with scale=None."""
     text_unscaled = "Education:\nB.Sc in Mathematics, CGPA: 3.8, First Class Honours."
     cgpa, scale, warnings = extract_cgpa_and_scale(text_unscaled)
-    assert cgpa is None
+    assert cgpa == 3.8
     assert scale is None
     assert len(warnings) == 1
     assert "without an explicit grading scale" in warnings[0]
+    assert "marked as unknown" in warnings[0]
+
+
+def test_extract_cgpa_with_percentage_scale():
+    """Verify percentage marks extract with 100.0 scale."""
+    text_pct = "B.Sc Degree with Aggregate: 82.5% in final year."
+    cgpa, scale, warnings = extract_cgpa_and_scale(text_pct)
+    assert cgpa == 82.5
+    assert scale == 100.0
+    assert warnings == []
 
 
 def test_extract_cgpa_rejects_value_exceeding_scale():

@@ -7,7 +7,7 @@ serialization for structured collections, and supports health diagnostics.
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -37,7 +37,7 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Optional[str] = None) -> None:
-    """Initialize SQLite database tables, constraints, and indexes."""
+    """Initialize SQLite database tables, constraints, indexes, and apply conditional migrations."""
     conn = get_connection(db_path)
     try:
         with conn:
@@ -60,6 +60,8 @@ def init_db(db_path: Optional[str] = None) -> None:
                 institution             TEXT NOT NULL,
                 program_name            TEXT NOT NULL,
                 official_url            TEXT NOT NULL,
+                canonical_url           TEXT,
+                source_type             TEXT DEFAULT 'unknown',
                 country                 TEXT,
                 degree_level            TEXT,
                 -- Requirements
@@ -72,6 +74,9 @@ def init_db(db_path: Optional[str] = None) -> None:
                 funding_amount_text     TEXT,
                 funding_coverage        TEXT DEFAULT 'unknown',
                 application_deadline    TEXT,
+                deadlines               TEXT, -- JSON list of DeadlineEntry dicts
+                effective_scholarship_deadline TEXT,
+                effective_admission_deadline   TEXT,
                 intake_session          TEXT,
                 required_documents      TEXT, -- JSON list
                 application_instructions TEXT,
@@ -91,12 +96,17 @@ def init_db(db_path: Optional[str] = None) -> None:
                 scholarship_eligible    TEXT DEFAULT 'unknown',
                 scholarship_ineligible_reasons TEXT, -- JSON list
                 missing_student_fields  TEXT, -- JSON list
-                -- Ranking
+                -- Result Group & Ranking
+                result_group            TEXT DEFAULT 'potentially_eligible',
                 rank                    INTEGER,
                 total_score             REAL,
                 score_breakdown         TEXT, -- JSON object
                 recommendation_rationale TEXT,
-                confidence              TEXT
+                confidence              TEXT,
+                is_mock                 INTEGER DEFAULT 1,
+                search_provider         TEXT DEFAULT 'mock',
+                scale_conversion_required INTEGER DEFAULT 0,
+                scale_conversion_explanation TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_opp_session ON opportunities(session_id);
@@ -145,6 +155,28 @@ def init_db(db_path: Optional[str] = None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_errors_session ON pipeline_errors(session_id);
             """)
+
+            # Dynamic, non-destructive migration for databases created under previous milestones
+            cursor = conn.execute("PRAGMA table_info(opportunities);")
+            existing_cols = {row["name"] for row in cursor.fetchall()}
+            migrations = [
+                ("canonical_url", "TEXT"),
+                ("source_type", "TEXT DEFAULT 'unknown'"),
+                ("deadlines", "TEXT"),
+                ("effective_scholarship_deadline", "TEXT"),
+                ("effective_admission_deadline", "TEXT"),
+                ("result_group", "TEXT DEFAULT 'potentially_eligible'"),
+                ("is_mock", "INTEGER DEFAULT 1"),
+                ("search_provider", "TEXT DEFAULT 'mock'"),
+                ("scale_conversion_required", "INTEGER DEFAULT 0"),
+                ("scale_conversion_explanation", "TEXT"),
+            ]
+            for col_name, col_def in migrations:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE opportunities ADD COLUMN {col_name} {col_def};")
+
+            # Index on result_group after column migration is guaranteed
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_group ON opportunities(result_group);")
     finally:
         conn.close()
 
@@ -269,6 +301,20 @@ def update_session_profile(
             )
     finally:
         conn.close()
+
+
+def delete_session(session_id: str, db_path: Optional[str] = None) -> bool:
+    """Delete a session record by ID; cascades to all child records via foreign keys."""
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?;", (session_id,)
+            )
+            return cursor.rowcount > 0
+    finally:
+        conn.close()
+
 
 
 # ============================================================================
@@ -421,5 +467,441 @@ def get_pipeline_errors(
                 "created_at": row["created_at"],
             })
         return errors
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# Serialization Helpers
+# ============================================================================
+
+def _enum_val(val: Any) -> Any:
+    """Extract primitive string/number from Enum or return val as-is."""
+    return val.value if hasattr(val, "value") else val
+
+
+def _safe_json_dumps(val: Any, default_val: str = "[]") -> str:
+    """Serialize value to JSON with defensive fallback."""
+    if val is None:
+        return default_val
+    if isinstance(val, str):
+        val_clean = val.strip()
+        if (val_clean.startswith("[") and val_clean.endswith("]")) or (
+            val_clean.startswith("{") and val_clean.endswith("}")
+        ):
+            return val_clean
+    try:
+        return json.dumps(val)
+    except (TypeError, ValueError):
+        return default_val
+
+
+def _safe_json_loads(val: Any, default_factory: Any) -> Any:
+    """Deserialize JSON string into Python structure with defensive fallback."""
+    if val is None:
+        return default_factory()
+    if isinstance(val, (list, dict)):
+        return val
+    try:
+        loaded = json.loads(val)
+        return loaded if loaded is not None else default_factory()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return default_factory()
+
+
+def _serialize_deadlines(deadlines_val: Any) -> str:
+    """Serialize deadline entries list preserving all fields."""
+    if not deadlines_val:
+        return json.dumps([])
+    serialized = []
+    for d in deadlines_val:
+        if hasattr(d, "model_dump"):
+            serialized.append(d.model_dump(mode="json"))
+        elif isinstance(d, dict):
+            d_copy = dict(d)
+            for k in ("deadline_date",):
+                if isinstance(d_copy.get(k), (date, datetime)):
+                    d_copy[k] = d_copy[k].isoformat()
+            if hasattr(d_copy.get("deadline_type"), "value"):
+                d_copy["deadline_type"] = d_copy["deadline_type"].value
+            serialized.append(d_copy)
+    return json.dumps(serialized)
+
+
+# ============================================================================
+# Opportunity CRUD Operations
+# ============================================================================
+
+def insert_opportunities(
+    opportunities: List[Dict[str, Any]], db_path: Optional[str] = None
+) -> None:
+    """Batch insert opportunity records with validated JSON serialization."""
+    if not opportunities:
+        return
+
+    conn = get_connection(db_path)
+    records = []
+    for opp in opportunities:
+        app_dl = opp.get("application_deadline")
+        if isinstance(app_dl, (date, datetime)):
+            app_dl = app_dl.isoformat()
+
+        eff_schol_dl = opp.get("effective_scholarship_deadline")
+        if isinstance(eff_schol_dl, (date, datetime)):
+            eff_schol_dl = eff_schol_dl.isoformat()
+
+        eff_adm_dl = opp.get("effective_admission_deadline")
+        if isinstance(eff_adm_dl, (date, datetime)):
+            eff_adm_dl = eff_adm_dl.isoformat()
+
+        last_v = opp.get("last_verified")
+        if isinstance(last_v, (date, datetime)):
+            last_v = last_v.isoformat()
+
+        fetch_ts = opp.get("page_fetch_timestamp")
+        if isinstance(fetch_ts, (date, datetime)):
+            fetch_ts = fetch_ts.isoformat()
+
+        gre_req = opp.get("gre_required")
+        gre_int = None
+        if gre_req is not None:
+            gre_int = 1 if gre_req else 0
+
+        page_acc = 1 if opp.get("page_accessible") else 0
+        ext_failed = 1 if opp.get("extraction_failed") else 0
+
+        sb = opp.get("score_breakdown")
+        sb_json = json.dumps(sb) if sb is not None else None
+
+        nat = opp.get("eligible_nationalities")
+        nat_json = json.dumps(nat) if nat is not None else None
+
+        records.append((
+            opp["opportunity_id"],
+            opp["session_id"],
+            _enum_val(opp.get("verification_tier", "T1")),
+            _enum_val(opp.get("type", "scholarship")),
+            opp["institution"],
+            opp["program_name"],
+            opp["official_url"],
+            opp.get("canonical_url"),
+            _enum_val(opp.get("source_type", "unknown")),
+            opp.get("country"),
+            _enum_val(opp.get("degree_level")),
+            nat_json,
+            opp.get("min_cgpa"),
+            opp.get("cgpa_scale"),
+            opp.get("english_test"),
+            opp.get("english_min_score"),
+            gre_int,
+            opp.get("funding_amount_text"),
+            _enum_val(opp.get("funding_coverage", "unknown")),
+            app_dl,
+            _serialize_deadlines(opp.get("deadlines")),
+            eff_schol_dl,
+            eff_adm_dl,
+            opp.get("intake_session"),
+            _safe_json_dumps(opp.get("required_documents"), default_val="[]"),
+            opp.get("application_instructions"),
+            opp.get("evidence_excerpt"),
+            opp.get("source_url", opp["official_url"]),
+            last_v,
+            page_acc,
+            opp.get("page_http_status"),
+            fetch_ts,
+            ext_failed,
+            _enum_val(opp.get("cycle_status", "uncertain")),
+            _safe_json_dumps(opp.get("conflicting_info_flags"), default_val="[]"),
+            _enum_val(opp.get("admission_eligible", "unknown")),
+            _safe_json_dumps(opp.get("admission_ineligible_reasons"), default_val="[]"),
+            _enum_val(opp.get("scholarship_eligible", "unknown")),
+            _safe_json_dumps(opp.get("scholarship_ineligible_reasons"), default_val="[]"),
+            _safe_json_dumps(opp.get("missing_student_fields"), default_val="[]"),
+            _enum_val(opp.get("result_group", "potentially_eligible")),
+            opp.get("rank"),
+            opp.get("total_score"),
+            sb_json,
+            opp.get("recommendation_rationale"),
+            opp.get("confidence"),
+            1 if opp.get("is_mock", True) else 0,
+            opp.get("search_provider", "mock"),
+            1 if opp.get("scale_conversion_required") else 0,
+            opp.get("scale_conversion_explanation"),
+        ))
+
+    insert_sql = """
+    INSERT INTO opportunities (
+        opportunity_id, session_id, verification_tier, type, institution, program_name,
+        official_url, canonical_url, source_type, country, degree_level,
+        eligible_nationalities, min_cgpa, cgpa_scale, english_test, english_min_score,
+        gre_required, funding_amount_text, funding_coverage, application_deadline,
+        deadlines, effective_scholarship_deadline, effective_admission_deadline,
+        intake_session, required_documents, application_instructions,
+        evidence_excerpt, source_url, last_verified, page_accessible,
+        page_http_status, page_fetch_timestamp, extraction_failed, cycle_status,
+        conflicting_info_flags, admission_eligible, admission_ineligible_reasons,
+        scholarship_eligible, scholarship_ineligible_reasons, missing_student_fields,
+        result_group, rank, total_score, score_breakdown, recommendation_rationale,
+        confidence, is_mock, search_provider, scale_conversion_required, scale_conversion_explanation
+    ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    );
+    """
+    try:
+        with conn:
+            conn.executemany(insert_sql, records)
+    finally:
+        conn.close()
+
+
+def _row_to_opportunity_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert SQLite row to clean deserialized opportunity dictionary."""
+    d = dict(row)
+    # Deserialize JSON fields
+    d["eligible_nationalities"] = _safe_json_loads(d.get("eligible_nationalities"), list) if d.get("eligible_nationalities") is not None else None
+    d["required_documents"] = _safe_json_loads(d.get("required_documents"), list)
+    d["conflicting_info_flags"] = _safe_json_loads(d.get("conflicting_info_flags"), list)
+    d["admission_ineligible_reasons"] = _safe_json_loads(d.get("admission_ineligible_reasons"), list)
+    d["scholarship_ineligible_reasons"] = _safe_json_loads(d.get("scholarship_ineligible_reasons"), list)
+    d["missing_student_fields"] = _safe_json_loads(d.get("missing_student_fields"), list)
+    d["deadlines"] = _safe_json_loads(d.get("deadlines"), list)
+    d["score_breakdown"] = _safe_json_loads(d.get("score_breakdown"), lambda: None) if d.get("score_breakdown") is not None else None
+
+    # Cast integer booleans and provenance
+    d["gre_required"] = bool(d["gre_required"]) if d.get("gre_required") is not None else None
+    d["page_accessible"] = bool(d.get("page_accessible", 0))
+    d["extraction_failed"] = bool(d.get("extraction_failed", 0))
+    d["is_mock"] = bool(d.get("is_mock", 1))
+    d["search_provider"] = d.get("search_provider") or "mock"
+    d["scale_conversion_required"] = bool(d.get("scale_conversion_required", 0))
+    d["scale_conversion_explanation"] = d.get("scale_conversion_explanation")
+    return d
+
+
+def get_opportunities(
+    session_id: str,
+    tier: Optional[str] = None,
+    result_group: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve opportunities for a session with optional tier and group filters."""
+    conn = get_connection(db_path)
+    try:
+        query = "SELECT * FROM opportunities WHERE session_id = ?"
+        params: List[Any] = [session_id]
+        if tier:
+            query += " AND verification_tier = ?"
+            params.append(tier)
+        if result_group:
+            query += " AND result_group = ?"
+            params.append(result_group)
+        query += " ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, total_score DESC, opportunity_id ASC;"
+
+        cursor = conn.execute(query, params)
+        return [_row_to_opportunity_dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_opportunity(
+    opportunity_id: str, db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieve a single opportunity by its ID."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT * FROM opportunities WHERE opportunity_id = ?;", (opportunity_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return _row_to_opportunity_dict(row)
+    finally:
+        conn.close()
+
+
+ALLOWED_OPPORTUNITY_UPDATE_FIELDS = frozenset({
+    "verification_tier", "type", "institution", "program_name", "official_url",
+    "canonical_url", "source_type", "country", "degree_level",
+    "eligible_nationalities", "min_cgpa", "cgpa_scale", "english_test",
+    "english_min_score", "gre_required", "funding_amount_text", "funding_coverage",
+    "application_deadline", "deadlines", "effective_scholarship_deadline",
+    "effective_admission_deadline", "intake_session", "required_documents",
+    "application_instructions", "evidence_excerpt", "source_url", "last_verified",
+    "page_accessible", "page_http_status", "page_fetch_timestamp",
+    "extraction_failed", "cycle_status", "conflicting_info_flags",
+    "admission_eligible", "admission_ineligible_reasons", "scholarship_eligible",
+    "scholarship_ineligible_reasons", "missing_student_fields", "result_group",
+    "rank", "total_score", "score_breakdown", "recommendation_rationale", "confidence",
+    "is_mock", "search_provider", "scale_conversion_required", "scale_conversion_explanation",
+})
+
+
+def update_opportunity(
+    opportunity: Dict[str, Any], db_path: Optional[str] = None
+) -> bool:
+    """Update an existing opportunity record with dynamic field updating."""
+    opp_id = opportunity.get("opportunity_id")
+    if not opp_id:
+        raise ValueError("opportunity_id is required to update an opportunity.")
+
+    fields = []
+    params = []
+    for k, v in opportunity.items():
+        if k == "opportunity_id" or k not in ALLOWED_OPPORTUNITY_UPDATE_FIELDS:
+            continue
+
+        if k in (
+            "application_deadline",
+            "effective_scholarship_deadline",
+            "effective_admission_deadline",
+            "last_verified",
+            "page_fetch_timestamp",
+        ):
+            val = v.isoformat() if isinstance(v, (date, datetime)) else v
+        elif k == "gre_required":
+            val = (1 if v else 0) if v is not None else None
+        elif k in ("page_accessible", "extraction_failed", "is_mock", "scale_conversion_required"):
+            val = 1 if v else 0
+        elif k == "search_provider":
+            val = str(v) if v is not None else "mock"
+        elif k == "deadlines":
+            val = _serialize_deadlines(v)
+        elif k in ("eligible_nationalities", "score_breakdown"):
+            val = json.dumps(v) if v is not None else None
+        elif k in (
+            "required_documents",
+            "conflicting_info_flags",
+            "admission_ineligible_reasons",
+            "scholarship_ineligible_reasons",
+            "missing_student_fields",
+        ):
+            val = _safe_json_dumps(v, default_val="[]")
+        else:
+            val = _enum_val(v)
+
+        fields.append(f"{k} = ?")
+        params.append(val)
+
+    if not fields:
+        # Check if record exists
+        return get_opportunity(opp_id, db_path=db_path) is not None
+
+    params.append(opp_id)
+    sql = f"UPDATE opportunities SET {', '.join(fields)} WHERE opportunity_id = ?;"
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.execute(sql, params)
+            return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+
+# ============================================================================
+# SOP Drafts CRUD Operations
+# ============================================================================
+
+def save_sop_draft(
+    draft: Dict[str, Any], db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """Persist or update an SOP draft record."""
+    conn = get_connection(db_path)
+    now_str = draft.get("generated_at")
+    if not now_str:
+        now_str = datetime.now(timezone.utc).isoformat()
+    elif isinstance(now_str, (date, datetime)):
+        now_str = now_str.isoformat()
+
+    sql = """
+    INSERT INTO sop_drafts (
+        draft_id, session_id, opportunity_id, institution, program_name,
+        sop_text, word_count, cited_profile_elements, missing_info_prompts,
+        suggested_revisions, generated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(draft_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        opportunity_id = excluded.opportunity_id,
+        institution = excluded.institution,
+        program_name = excluded.program_name,
+        sop_text = excluded.sop_text,
+        word_count = excluded.word_count,
+        cited_profile_elements = excluded.cited_profile_elements,
+        missing_info_prompts = excluded.missing_info_prompts,
+        suggested_revisions = excluded.suggested_revisions,
+        generated_at = excluded.generated_at;
+    """
+    cpe_json = _safe_json_dumps(draft.get("cited_profile_elements"), default_val="[]")
+    mip_json = _safe_json_dumps(draft.get("missing_info_prompts"), default_val="[]")
+    sr_json = _safe_json_dumps(draft.get("suggested_revisions"), default_val="[]")
+
+    params = (
+        draft["draft_id"],
+        draft["session_id"],
+        draft.get("opportunity_id"),
+        draft["institution"],
+        draft["program_name"],
+        draft["sop_text"],
+        draft["word_count"],
+        cpe_json,
+        mip_json,
+        sr_json,
+        now_str,
+    )
+    try:
+        with conn:
+            conn.execute(sql, params)
+        return {
+            "draft_id": draft["draft_id"],
+            "session_id": draft["session_id"],
+            "opportunity_id": draft.get("opportunity_id"),
+            "institution": draft["institution"],
+            "program_name": draft["program_name"],
+            "sop_text": draft["sop_text"],
+            "word_count": draft["word_count"],
+            "cited_profile_elements": _safe_json_loads(cpe_json, list),
+            "missing_info_prompts": _safe_json_loads(mip_json, list),
+            "suggested_revisions": _safe_json_loads(sr_json, list),
+            "generated_at": now_str,
+        }
+    finally:
+        conn.close()
+
+
+def get_sop_draft(
+    session_id: str,
+    opportunity_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve an SOP draft by session_id and optional opportunity_id."""
+    conn = get_connection(db_path)
+    try:
+        if opportunity_id:
+            cursor = conn.execute(
+                """
+                SELECT * FROM sop_drafts
+                WHERE session_id = ? AND opportunity_id = ?
+                ORDER BY generated_at DESC LIMIT 1;
+                """,
+                (session_id, opportunity_id),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT * FROM sop_drafts
+                WHERE session_id = ?
+                ORDER BY generated_at DESC LIMIT 1;
+                """,
+                (session_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["cited_profile_elements"] = _safe_json_loads(d.get("cited_profile_elements"), list)
+        d["missing_info_prompts"] = _safe_json_loads(d.get("missing_info_prompts"), list)
+        d["suggested_revisions"] = _safe_json_loads(d.get("suggested_revisions"), list)
+        return d
     finally:
         conn.close()

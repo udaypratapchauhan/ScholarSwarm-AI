@@ -10,6 +10,10 @@ import json
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import uuid
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -23,14 +27,22 @@ import starlette.formparsers
 from starlette.datastructures import UploadFile
 
 from backend.agents.spa import extract_student_profile
+from backend.agents.ora import discover_opportunities
+from backend.agents.eeva import verify_opportunities
+from backend.agents.mra import rank_opportunities
+from backend.agents.asa import generate_sop_draft
 from backend.app.database import (
     check_db_health,
     create_session,
+    get_opportunities,
     get_pipeline_events,
     get_session,
+    get_sop_draft,
     init_db,
+    insert_opportunities,
     record_pipeline_error,
     record_pipeline_event,
+    save_sop_draft,
 )
 from backend.app.schemas import (
     AgentRole,
@@ -240,6 +252,103 @@ def _parse_countries(pref: Any) -> List[str]:
 
 
 @app.post(
+    "/api/profile/extract-preview",
+    summary="Extract Profile Preview from Uploaded Document",
+    description="Deterministically parses an uploaded resume or transcript file and returns extracted candidate fields (name, email, CGPA, scale, evidence, ambiguity flag) for interactive student verification before session creation.",
+)
+@app.post("/api/sessions/extract-preview", include_in_schema=False)
+async def extract_profile_preview(request: Request) -> Dict[str, Any]:
+    """Preview deterministic document extraction results before session creation."""
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not parse form data: {exc}",
+        ) from exc
+
+    raw_resume = form.get("resume_file")
+    raw_transcript = form.get("transcript_file")
+    resume_file: Optional[UploadFile] = raw_resume if isinstance(raw_resume, UploadFile) else None
+    transcript_file: Optional[UploadFile] = raw_transcript if isinstance(raw_transcript, UploadFile) else None
+
+    if not resume_file and not transcript_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one document (resume_file or transcript_file) must be provided.",
+        )
+
+    all_upload_files = [val for _, val in form.multi_items() if isinstance(val, UploadFile)]
+    try:
+        extracted_texts: List[str] = []
+        doc_warnings: List[str] = []
+        doc_names: List[str] = []
+
+        for uf in (resume_file, transcript_file):
+            if uf:
+                try:
+                    uf_bytes = await read_upload_file_safely(uf)
+                    text, w = extract_document_text(uf_bytes, filename=uf.filename)
+                    extracted_texts.append(text)
+                    doc_warnings.extend(w)
+                    if uf.filename:
+                        doc_names.append(uf.filename)
+                except UploadTooLargeError as exc:
+                    raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc))
+                except (InvalidDocumentFormatError, DocumentComplexityError, DocumentParsingError) as exc:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+        combined_text = "\n\n".join(extracted_texts)
+        from backend.agents.spa import (
+            extract_cgpa_and_scale_detailed,
+            extract_degree_title,
+            extract_email,
+            extract_name,
+            extract_sections,
+            extract_skills,
+            extract_standardized_tests,
+            extract_work_experience_years,
+        )
+
+        name = extract_name(combined_text)
+        email = extract_email(combined_text)
+        current_degree = extract_degree_title(combined_text)
+        cgpa_details = extract_cgpa_and_scale_detailed(combined_text)
+        ielts, toefl, gre, gmat, test_w = extract_standardized_tests(combined_text)
+        work_exp = extract_work_experience_years(combined_text)
+        sections = extract_sections(combined_text)
+        skills = extract_skills(sections, combined_text)
+        explicit_skills = [s.skill for s in skills if s.confidence == "explicit"]
+
+        doc_label = ", ".join(doc_names) if doc_names else "Uploaded Document"
+
+        return {
+            "name": name,
+            "email": email,
+            "current_degree": current_degree,
+            "cgpa": cgpa_details["val"],
+            "cgpa_scale": cgpa_details["scale"],
+            "cgpa_source": f"Extracted from {doc_label}" if cgpa_details["val"] is not None else None,
+            "cgpa_evidence": cgpa_details["evidence"],
+            "is_ambiguous": cgpa_details["is_ambiguous"],
+            "ambiguity_reason": cgpa_details["ambiguity_reason"],
+            "ielts_score": ielts,
+            "toefl_score": toefl,
+            "gre_score": gre,
+            "work_experience_years": work_exp,
+            "skills": explicit_skills,
+            "warnings": doc_warnings + cgpa_details["warnings"] + test_w,
+            "document_filename": doc_label,
+        }
+    finally:
+        for uf in all_upload_files:
+            try:
+                await uf.close()
+            except Exception:
+                pass
+
+
+@app.post(
     "/api/sessions",
     status_code=status.HTTP_201_CREATED,
     summary="Create Research Session & Ingest Documents or Profile",
@@ -413,13 +522,101 @@ async def create_research_session(request: Request) -> Dict[str, Any]:
 
         countries = _parse_countries(preferred_countries_raw)
 
-        if not resume_file and not transcript_file and not direct_profile_raw:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one document (resume_file) or direct_profile must be provided.",
-            )
+        # Collect explicit user-entered / verified fields from form data
+        user_overrides: Dict[str, Any] = {}
+        if form.get("name") is not None and str(form.get("name")).strip():
+            user_overrides["name"] = str(form.get("name")).strip()
+        if form.get("email") is not None and str(form.get("email")).strip():
+            user_overrides["email"] = str(form.get("email")).strip()
+        if form.get("nationality") is not None and str(form.get("nationality")).strip():
+            user_overrides["nationality"] = str(form.get("nationality")).strip()
+        if form.get("current_degree") is not None and str(form.get("current_degree")).strip():
+            user_overrides["current_degree"] = str(form.get("current_degree")).strip()
 
-        if direct_profile_raw:
+        cgpa_val_raw = form.get("cgpa")
+        if cgpa_val_raw is not None:
+            c_str = str(cgpa_val_raw).strip()
+            if c_str:
+                try:
+                    user_overrides["cgpa"] = float(c_str)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid CGPA value '{c_str}'; must be numeric.",
+                    )
+            else:
+                user_overrides["cgpa"] = None
+
+        scale_val_raw = form.get("cgpa_scale")
+        if scale_val_raw is not None:
+            s_str = str(scale_val_raw).strip().lower()
+            if s_str in ("", "unknown", "none"):
+                user_overrides["cgpa_scale"] = None
+            else:
+                try:
+                    user_overrides["cgpa_scale"] = float(s_str)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid grading scale value '{s_str}'; must be numeric.",
+                    )
+
+        ielts_raw = form.get("ielts_score")
+        if ielts_raw is not None and str(ielts_raw).strip():
+            try:
+                user_overrides["ielts_score"] = float(str(ielts_raw).strip())
+            except ValueError:
+                pass
+
+        gre_raw = form.get("gre_score")
+        if gre_raw is not None and str(gre_raw).strip():
+            try:
+                user_overrides["gre_score"] = int(str(gre_raw).strip())
+            except ValueError:
+                pass
+
+        work_raw = form.get("work_experience_years")
+        if work_raw is not None and str(work_raw).strip():
+            try:
+                user_overrides["work_experience_years"] = float(str(work_raw).strip())
+            except ValueError:
+                pass
+
+        if not resume_file and not transcript_file and not direct_profile_raw:
+            has_direct_info = any(
+                form.get(k) for k in ("name", "email", "cgpa", "current_degree", "skills_text", "ielts_score")
+            )
+            if has_direct_info:
+                skills_input = form.get("skills_text") or ""
+                skills_list = [
+                    {"skill": s.strip(), "confidence": "explicit"}
+                    for s in str(skills_input).split(",")
+                    if s.strip()
+                ]
+                p_data = {
+                    "session_id": session_id,
+                    "field_of_study": str(field_of_study).strip(),
+                    "target_degree": target_degree_enum.value,
+                    "preferred_countries": countries,
+                    "name": user_overrides.get("name"),
+                    "email": user_overrides.get("email"),
+                    "nationality": user_overrides.get("nationality"),
+                    "current_degree": user_overrides.get("current_degree"),
+                    "cgpa": user_overrides.get("cgpa"),
+                    "cgpa_scale": user_overrides.get("cgpa_scale"),
+                    "ielts_score": user_overrides.get("ielts_score"),
+                    "gre_score": user_overrides.get("gre_score"),
+                    "work_experience_years": user_overrides.get("work_experience_years"),
+                    "skills_extracted": skills_list,
+                }
+                profile = StudentProfile(**p_data)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="At least one document (resume_file) or direct_profile must be provided.",
+                )
+
+        elif direct_profile_raw:
             try:
                 p_data = json.loads(str(direct_profile_raw))
                 p_data["session_id"] = session_id
@@ -427,6 +624,8 @@ async def create_research_session(request: Request) -> Dict[str, Any]:
                 p_data["target_degree"] = target_degree_enum.value
                 if countries:
                     p_data["preferred_countries"] = countries
+                if user_overrides:
+                    p_data.update(user_overrides)
                 profile = StudentProfile(**p_data)
             except Exception as exc:
                 raise HTTPException(
@@ -491,6 +690,7 @@ async def create_research_session(request: Request) -> Dict[str, Any]:
                     preferred_countries=countries,
                     github_url=str(github_url) if github_url else None,
                     document_warnings=document_warnings,
+                    user_overrides=user_overrides,
                 )
             except Exception as exc:
                 raise HTTPException(
@@ -617,3 +817,142 @@ def get_session_events(
         )
 
     return get_pipeline_events(session_id=session_id, since_id=since_id)
+
+
+# ============================================================================
+# Scholarship Research Pipeline Endpoints
+# ============================================================================
+
+@app.post(
+    "/api/sessions/{session_id}/research",
+    summary="Execute Scholarship Research & Verification Pipeline",
+    description="Orchestrates ORA (Discovery), EEVA (Verification), MRA (Ranking), and ASA (SOP Draft) for a session.",
+)
+async def execute_scholarship_research(session_id: str) -> Dict[str, Any]:
+    """Execute end-to-end multi-agent scholarship research pipeline for a session."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+
+    profile_dict = session.get("student_profile") or {}
+    if not isinstance(profile_dict, dict):
+        profile_dict = {}
+
+    # Ensure mandatory fields have valid defaults
+    if "session_id" not in profile_dict:
+        profile_dict["session_id"] = session_id
+    if "field_of_study" not in profile_dict or not profile_dict["field_of_study"]:
+        profile_dict["field_of_study"] = "Computer Science"
+    if "target_degree" not in profile_dict or not profile_dict["target_degree"]:
+        profile_dict["target_degree"] = DegreeLevel.MASTERS.value
+
+    try:
+        student_profile = StudentProfile(**profile_dict)
+    except Exception:
+        student_profile = StudentProfile(
+            session_id=session_id,
+            field_of_study=profile_dict.get("field_of_study") or "Computer Science",
+            target_degree=DegreeLevel.MASTERS,
+        )
+
+    # 1. Opportunity Research Agent (ORA)
+    candidates = discover_opportunities(student_profile=student_profile, session_id=session_id)
+
+    # 2. Eligibility Evaluation & Verification Agent (EEVA)
+    verified = verify_opportunities(
+        candidates=candidates,
+        student_profile=student_profile,
+        session_id=session_id,
+    )
+
+    # 3. Matchmaking & Ranking Agent (MRA)
+    ranked = rank_opportunities(
+        opportunities=verified,
+        student_profile=student_profile,
+        session_id=session_id,
+    )
+
+    # Persist verified & ranked opportunities
+    insert_opportunities(ranked)
+
+    # 4. Application Strategy Agent (ASA)
+    sop_draft = None
+    if ranked:
+        # Find highest-ranked or first candidate
+        top_opp = next((o for o in ranked if o.get("rank") == 1), ranked[0])
+        sop_draft = generate_sop_draft(
+            opportunity=top_opp,
+            student_profile=student_profile,
+            session_id=session_id,
+        )
+        save_sop_draft(sop_draft)
+
+    # Final completion event
+    record_pipeline_event(
+        event_id=f"evt-sys-{uuid.uuid4().hex[:8]}",
+        session_id=session_id,
+        agent=AgentRole.SYSTEM.value,
+        event_type="pipeline_completed",
+        message=f"Scholarship research completed successfully. {len(ranked)} opportunities evaluated.",
+        payload={
+            "opportunity_count": len(ranked),
+            "top_5_count": sum(1 for o in ranked if o.get("rank") is not None and o.get("rank") <= 5),
+            "sop_generated": sop_draft is not None,
+        },
+    )
+
+    return {
+        "session_id": session_id,
+        "status": "completed",
+        "opportunity_count": len(ranked),
+        "top_5_count": sum(1 for o in ranked if o.get("rank") is not None and o.get("rank") <= 5),
+        "sop_generated": sop_draft is not None,
+    }
+
+
+@app.get(
+    "/api/sessions/{session_id}/opportunities",
+    summary="Retrieve Ranked Scholarship Opportunities",
+    description="Fetches ranked, verified opportunities for a session with optional tier and group filters.",
+)
+def get_session_opportunities(
+    session_id: str,
+    tier: Optional[str] = Query(None, description="Filter by verification tier (T1-T4)"),
+    result_group: Optional[str] = Query(None, description="Filter by result group (confirmed_eligible, etc.)"),
+) -> List[Dict[str, Any]]:
+    """Retrieve verified scholarship opportunities for session."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    return get_opportunities(session_id=session_id, tier=tier, result_group=result_group)
+
+
+@app.get(
+    "/api/sessions/{session_id}/sop",
+    summary="Retrieve Evidence-Grounded SOP Draft",
+    description="Fetches the synthesized Statement of Purpose draft and application guidance for a session.",
+)
+def get_session_sop(
+    session_id: str,
+    opportunity_id: Optional[str] = Query(None, description="Optional target opportunity ID filter"),
+) -> Dict[str, Any]:
+    """Retrieve Statement of Purpose draft for session."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    draft = get_sop_draft(session_id=session_id, opportunity_id=opportunity_id)
+    if not draft:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No SOP draft found for session '{session_id}'.",
+        )
+    return draft

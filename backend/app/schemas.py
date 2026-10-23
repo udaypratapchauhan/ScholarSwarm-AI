@@ -105,6 +105,37 @@ class SkillConfidence(str, Enum):
     INFERRED = "inferred"  # Derived from concrete project descriptions
 
 
+class SourceType(str, Enum):
+    """Source provenance and trust classification.
+
+    OFFICIAL_PROVIDER: Direct university, government ministry, or endowed trust.
+    RELIABLE_SECONDARY: Accredited bilateral educational commission/directory (e.g. DAAD, Campus France).
+    AGGREGATOR: Third-party commercial directory, student blog, or listing portal.
+    """
+    OFFICIAL_PROVIDER = "official_provider"
+    RELIABLE_SECONDARY = "reliable_secondary"
+    AGGREGATOR = "aggregator"
+    UNKNOWN = "unknown"
+
+
+class DeadlineType(str, Enum):
+    """Specific category of application deadline."""
+    SCHOLARSHIP = "scholarship"               # Dedicated scholarship/fellowship award cutoff
+    ADMISSION = "admission"                   # University general admission deadline
+    PRIORITY_AID = "priority_aid"            # Early/priority financial aid consideration cutoff
+    DEPARTMENTAL = "departmental"             # Department/faculty-specific deadline
+    GENERAL = "general"                       # General program cutoff
+    UNKNOWN = "unknown"                       # Ambiguous or unstated deadline type
+
+
+class ResultGroup(str, Enum):
+    """Mutually exclusive outcome classification for evaluated opportunities."""
+    CONFIRMED_ELIGIBLE = "confirmed_eligible"
+    POTENTIALLY_ELIGIBLE = "potentially_eligible"
+    INELIGIBLE = "ineligible"
+    EXPIRED = "expired"
+
+
 # ============================================================================
 # Student Profile Models
 # ============================================================================
@@ -163,10 +194,12 @@ class StudentProfile(BaseModel):
 
     @model_validator(mode="after")
     def validate_cgpa_and_scale(self) -> "StudentProfile":
-        """Ensure that if CGPA is provided, the grading scale is also provided and valid."""
-        if self.cgpa is not None:
-            if self.cgpa_scale is None:
-                raise ValueError("cgpa_scale is required whenever cgpa is provided.")
+        """Validate CGPA bounds against scale if scale is provided.
+
+        Allows scale to be None when grading scale is unknown or unstated,
+        preserving the raw CGPA value truthfully without inventing a scale.
+        """
+        if self.cgpa is not None and self.cgpa_scale is not None:
             if self.cgpa > self.cgpa_scale:
                 raise ValueError(
                     f"cgpa ({self.cgpa}) cannot exceed the specified cgpa_scale ({self.cgpa_scale})."
@@ -209,6 +242,33 @@ class OpportunityStub(BaseModel):
         return v_clean
 
 
+class DeadlineEntry(BaseModel):
+    """Structured deadline entry with classification, verbatim excerpt, and timezone preservation."""
+    model_config = ConfigDict(extra="forbid")
+
+    deadline_type: DeadlineType = Field(
+        default=DeadlineType.UNKNOWN, description="Type or purpose of cutoff"
+    )
+    deadline_date: Optional[date] = Field(
+        None, description="Calendar date YYYY-MM-DD"
+    )
+    deadline_time: Optional[str] = Field(
+        None, description="Stated cutoff time e.g. '23:59'"
+    )
+    timezone: Optional[str] = Field(
+        None, description="Preserved timezone; None if unstated on source page"
+    )
+    intake_cycle: Optional[str] = Field(
+        None, description="Target intake e.g. 'Fall 2026'"
+    )
+    raw_text: str = Field(
+        ..., min_length=1, description="Verbatim text excerpt containing the deadline statement"
+    )
+    is_inferred_year: bool = Field(
+        False, description="True if calendar year was omitted on page and inferred"
+    )
+
+
 class VerifiedOpportunity(BaseModel):
     """Verified opportunity enriched with source evidence and independent eligibility statuses."""
     model_config = ConfigDict(extra="forbid")
@@ -223,6 +283,10 @@ class VerifiedOpportunity(BaseModel):
     degree_level: Optional[DegreeLevel] = Field(None, description="Target degree level")
 
     # Provenance and verification
+    canonical_url: Optional[str] = Field(None, description="Final validated URL after safe redirects")
+    source_type: SourceType = Field(
+        default=SourceType.UNKNOWN, description="Trust tier of source"
+    )
     verification_tier: VerificationTier = Field(
         ..., description="Verification tier achieved (T1-T4)"
     )
@@ -232,6 +296,12 @@ class VerifiedOpportunity(BaseModel):
     extraction_failed: bool = Field(False, description="Whether structured requirement extraction failed")
     conflicting_info_flags: List[str] = Field(
         default_factory=list, description="Explicit record of discrepancies (e.g. deadline conflict)"
+    )
+    is_mock: bool = Field(
+        default=True, description="Whether candidate originated from mock search pool"
+    )
+    search_provider: str = Field(
+        default="mock", description="Search provider used for discovery (e.g. tavily, serper, mock)"
     )
 
     # Extracted requirements (nullable when not found on official page)
@@ -251,6 +321,15 @@ class VerifiedOpportunity(BaseModel):
     )
     application_deadline: Optional[date] = Field(
         None, description="Exact application deadline date; null if unverified"
+    )
+    deadlines: List[DeadlineEntry] = Field(
+        default_factory=list, description="Structured extracted deadlines"
+    )
+    effective_scholarship_deadline: Optional[date] = Field(
+        None, description="Resolved deadline date for scholarship funding"
+    )
+    effective_admission_deadline: Optional[date] = Field(
+        None, description="Resolved deadline date for general program admission"
     )
     intake_session: Optional[str] = Field(
         None, description="Target academic intake (e.g. 'Fall 2026', '2026-2027')"
@@ -287,11 +366,38 @@ class VerifiedOpportunity(BaseModel):
     missing_student_fields: List[str] = Field(
         default_factory=list, description="Student profile fields needed to resolve unknown eligibility"
     )
+    scale_conversion_required: bool = Field(
+        default=False,
+        description="True if student grading scale differs from program scale and requires official evaluation",
+    )
+    scale_conversion_explanation: Optional[str] = Field(
+        None,
+        description="User-friendly explanation of grading scale mismatch and required official conversion action",
+    )
 
     # Currency
     cycle_status: CycleStatus = Field(
         default=CycleStatus.UNCERTAIN,
         description="Current, expired, or uncertain intake cycle",
+    )
+
+    # Result Grouping & Optional Ranking Placement
+    result_group: ResultGroup = Field(
+        default=ResultGroup.POTENTIALLY_ELIGIBLE,
+        description="Mutually exclusive outcome group",
+    )
+    rank: Optional[int] = Field(None, ge=1, description="1-based rank position")
+    total_score: Optional[float] = Field(
+        None, ge=0.0, le=100.0, description="Overall explainable score out of 100"
+    )
+    score_breakdown: Optional[Dict[str, float]] = Field(
+        None, description="Named factor contributions summing to total_score"
+    )
+    recommendation_rationale: Optional[str] = Field(
+        None, description="Explainable rationale grounded in score factors"
+    )
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+        None, description="Confidence grade based on data completeness and verification tier"
     )
 
     @field_validator("official_url", "source_url")
@@ -302,11 +408,29 @@ class VerifiedOpportunity(BaseModel):
             raise ValueError("URL must start with http:// or https://")
         return v_clean
 
+    @field_validator("canonical_url")
+    @classmethod
+    def validate_canonical_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_clean = v.strip()
+        if not (v_clean.startswith("http://") or v_clean.startswith("https://")):
+            raise ValueError("canonical_url must start with http:// or https://")
+        return v_clean
+
     @model_validator(mode="after")
     def validate_min_cgpa_scale(self) -> "VerifiedOpportunity":
-        if self.min_cgpa is not None and self.cgpa_scale is None:
-            raise ValueError("cgpa_scale is required whenever min_cgpa is provided.")
+        """Validate minimum CGPA does not exceed scale when scale is specified.
+
+        Allows scale to be None when unstated on official portal.
+        """
+        if self.min_cgpa is not None and self.cgpa_scale is not None:
+            if self.min_cgpa > self.cgpa_scale:
+                raise ValueError(
+                    f"min_cgpa ({self.min_cgpa}) cannot exceed the specified cgpa_scale ({self.cgpa_scale})."
+                )
         return self
+
 
 
 # ============================================================================
@@ -395,4 +519,3 @@ class HealthResponse(BaseModel):
     database: Literal["connected", "disconnected"] = Field(..., description="Database connection state")
     version: str = Field("0.1.0", description="Application version")
     timestamp: datetime = Field(default_factory=utc_now, description="Current server UTC timestamp")
-

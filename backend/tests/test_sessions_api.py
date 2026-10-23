@@ -717,3 +717,142 @@ def test_poll_pipeline_events_cross_session_since_id(client: TestClient):
     # Poll session 2 with session 1's event_id as since_id
     cross_evts = client.get(f"/api/sessions/{s2_id}/events?since_id={first_s1_evt}").json()
     assert cross_evts == []
+
+
+# ============================================================================
+# Regression Tests for CGPA Scale, Manual Override & Preview Extraction
+# ============================================================================
+
+def test_extract_profile_preview_endpoint(client: TestClient):
+    """Verify POST /api/profile/extract-preview returns extracted fields with provenance and evidence."""
+    pdf_content = (
+        "Name: Uday Chauhan\n"
+        "Email: uday@example.com\n"
+        "Bachelor of Technology in Computer Science\n"
+        "Cumulative CGPA: 7.6 / 10.0\n"
+        "Skills: Python, C++, Linux\n"
+    )
+    pdf_bytes = make_pdf_bytes(pdf_content)
+
+    resp = client.post(
+        "/api/profile/extract-preview",
+        files={"resume_file": ("resume.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "Uday Chauhan"
+    assert data["email"] == "uday@example.com"
+    assert data["cgpa"] == 7.6
+    assert data["cgpa_scale"] == 10.0
+    assert "CGPA: 7.6 / 10.0" in (data["cgpa_evidence"] or "")
+    assert data["is_ambiguous"] is False
+    assert "Python" in data["skills"]
+
+
+def test_extract_profile_preview_ambiguous_grade(client: TestClient):
+    """Verify ambiguous grades (e.g. CGPA 7.6 and separate 76% marks) are flagged with ambiguity warning."""
+    pdf_content = (
+        "Name: Candidate Two\n"
+        "Bachelor of Science in Engineering\n"
+        "CGPA: 7.6 / 10.0\n"
+        "Senior Secondary: 76% marks\n"
+    )
+    pdf_bytes = make_pdf_bytes(pdf_content)
+
+    resp = client.post(
+        "/api/profile/extract-preview",
+        files={"resume_file": ("cv.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["cgpa"] == 7.6
+    assert data["cgpa_scale"] == 10.0
+    assert data["is_ambiguous"] is True
+    assert "Multiple academic records found" in data["ambiguity_reason"]
+
+
+def test_create_session_with_explicit_cgpa_override(client: TestClient):
+    """Verify explicit form CGPA 7.6/10.0 overrides any document extraction result without silent multiplication."""
+    # Document text has 76% which previously caused incorrect 76.0/100.0 extraction
+    pdf_content = (
+        "Name: Uday Pratap Chauhan\n"
+        "Aggregate: 76%\n"
+    )
+    pdf_bytes = make_pdf_bytes(pdf_content)
+
+    resp = client.post(
+        "/api/sessions",
+        data={
+            "field_of_study": "Computer Science",
+            "target_degree": "masters",
+            "preferred_countries": "Canada",
+            "cgpa": "7.6",
+            "cgpa_scale": "10.0",
+            "name": "Uday Pratap Chauhan",
+        },
+        files={"resume_file": ("resume.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert resp.status_code == 201
+    profile = resp.json()["student_profile"]
+    assert profile["cgpa"] == 7.6
+    assert profile["cgpa_scale"] == 10.0
+    assert profile["cgpa"] != 76.0
+
+
+def test_create_session_direct_multipart_without_documents(client: TestClient):
+    """Verify session can be created directly from multipart form fields with 7.6/10.0 and no uploaded files."""
+    resp = client.post(
+        "/api/sessions",
+        data={
+            "field_of_study": "Computer Science",
+            "target_degree": "masters",
+            "preferred_countries": "Canada",
+            "name": "Manual Student",
+            "email": "manual@student.org",
+            "cgpa": "7.6",
+            "cgpa_scale": "10.0",
+        },
+    )
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["status"] == "completed"
+    profile = data["student_profile"]
+    assert profile["name"] == "Manual Student"
+    assert profile["cgpa"] == 7.6
+    assert profile["cgpa_scale"] == 10.0
+    assert profile["preferred_countries"] == ["Canada"]
+
+
+def test_create_session_unknown_scale_manual(client: TestClient):
+    """Verify student entering 7.6 with unknown scale preserves 7.6 with scale=None."""
+    resp = client.post(
+        "/api/sessions",
+        data={
+            "field_of_study": "Data Science",
+            "target_degree": "masters",
+            "cgpa": "7.6",
+            "cgpa_scale": "unknown",
+        },
+    )
+    assert resp.status_code == 201
+    profile = resp.json()["student_profile"]
+    assert profile["cgpa"] == 7.6
+    assert profile["cgpa_scale"] is None
+
+
+def test_create_session_percentage_scale_manual(client: TestClient):
+    """Verify student entering 76% explicitly remains distinct on 100.0 scale and is not relabelled as CGPA 7.6/10."""
+    resp = client.post(
+        "/api/sessions",
+        data={
+            "field_of_study": "Data Science",
+            "target_degree": "masters",
+            "cgpa": "76.0",
+            "cgpa_scale": "100.0",
+        },
+    )
+    assert resp.status_code == 201
+    profile = resp.json()["student_profile"]
+    assert profile["cgpa"] == 76.0
+    assert profile["cgpa_scale"] == 100.0
+

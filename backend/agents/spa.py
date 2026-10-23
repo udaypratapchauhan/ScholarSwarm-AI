@@ -7,7 +7,7 @@ explicit grading scales for CGPA.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from backend.app.schemas import (
     DegreeLevel,
@@ -87,48 +87,174 @@ def extract_name(text: str) -> Optional[str]:
     return None
 
 
+def extract_cgpa_and_scale_detailed(text: str) -> Dict[str, Any]:
+    """Extract CGPA and grading scale with strict validation, evidence provenance, and ambiguity detection.
+
+    Safeguards:
+    - Never guesses or silently invents a scale (e.g. 4.0 or 10.0).
+    - Preserves unscaled CGPA with scale=None and logs a warning.
+    - Preserves percentage separately on scale=100.0.
+    - Prioritizes university CGPA over secondary percentages when both appear.
+    - Flags ambiguity when conflicting or multiple grading metrics are detected.
+    """
+    warnings: List[str] = []
+
+    # 1. Search for scaled CGPA: "CGPA: 3.85/4.0", "7.6/10 CGPA", "GPA 8.5 out of 10.0"
+    scale_pattern_1 = (
+        r"(?i)\b(?:CGPA|GPA|Grade Point Average|Cumulative GPA)\s*[:=\-]?\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:\/|\bout of\b)\s*([0-9]+(?:\.[0-9]+)?)"
+    )
+    scale_pattern_2 = (
+        r"(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(?:\/|\bout of\b)\s*([0-9]+(?:\.[0-9]+)?)\s*"
+        r"(?:CGPA|GPA|Grade Point Average|Cumulative GPA)\b"
+    )
+
+    match_scaled = re.search(scale_pattern_1, text) or re.search(scale_pattern_2, text)
+
+    # 2. Search for unscaled CGPA: "CGPA: 7.6", "7.6 CGPA", "GPA 3.85"
+    unscaled_pattern_1 = (
+        r"(?i)\b(?:CGPA|GPA|Grade Point Average|Cumulative GPA)\s*[:=\-]?\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\b(?!\s*(?:\/|\bout of\b|%))"
+    )
+    unscaled_pattern_2 = (
+        r"(?i)\b([0-9]+(?:\.[0-9]+)?)\b\s*(?:CGPA|GPA)\b(?!\s*(?:\/|\bout of\b|%))"
+    )
+    match_unscaled = re.search(unscaled_pattern_1, text) or re.search(unscaled_pattern_2, text)
+
+    # 3. Search for percentage: "Percentage: 76%", "Aggregate: 82%", "76% marks"
+    percentage_pattern = (
+        r"(?i)\b(?:Percentage|Aggregate|Marks|Score)\s*[:=\-]?\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*%"
+    )
+    match_pct = re.search(percentage_pattern, text)
+    if not match_pct:
+        match_pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:marks|aggregate|score|grade)\b", text, re.IGNORECASE)
+    if not match_pct:
+        match_pct = re.search(r"(?i)\b(?:Class\s*(?:10|12|X|XII)(?:th)?|Secondary|CBSE|ICSE).*?([0-9]+(?:\.[0-9]+)?)\s*%", text)
+
+    # Analyze candidates
+    cgpa_cand: Optional[Tuple[float, Optional[float], str]] = None
+    scaled_attempted = False
+    if match_scaled:
+        scaled_attempted = True
+        try:
+            v = float(match_scaled.group(1))
+            s = float(match_scaled.group(2))
+            if s > 0 and v <= s:
+                cgpa_cand = (v, s, match_scaled.group(0).strip())
+            elif s <= 0:
+                warnings.append(f"Invalid non-positive CGPA scale ({s}) found; omitted.")
+            else:
+                warnings.append(f"CGPA ({v}) cannot exceed grading scale ({s}); omitted.")
+        except ValueError:
+            pass
+
+    if not scaled_attempted and match_unscaled:
+        try:
+            v = float(match_unscaled.group(1))
+            warnings.append(
+                f"CGPA value '{v}' was detected without an explicit grading scale. "
+                "Preserving raw value with scale marked as unknown."
+            )
+            cgpa_cand = (v, None, match_unscaled.group(0).strip())
+        except ValueError:
+            pass
+
+    pct_cand: Optional[Tuple[float, float, str]] = None
+    if match_pct:
+        try:
+            p_val = float(match_pct.group(1))
+            if 0 <= p_val <= 100.0:
+                pct_cand = (p_val, 100.0, match_pct.group(0).strip())
+            else:
+                warnings.append(f"Percentage ({p_val}) outside valid range (0-100%); omitted.")
+        except ValueError:
+            pass
+
+    # Check for ambiguity between CGPA and Percentage
+    if cgpa_cand and pct_cand:
+        c_val, c_scale, c_ev = cgpa_cand
+        p_val, _, p_ev = pct_cand
+        is_ambiguous = True
+        amb_msg = (
+            f"Multiple academic records found in document: CGPA '{c_val}' ({c_ev}) "
+            f"and Percentage '{p_val}%' ({p_ev}). Higher-education CGPA prioritized; "
+            "please verify your college grading scale."
+        )
+        warnings.append(amb_msg)
+        return {
+            "val": c_val,
+            "scale": c_scale,
+            "warnings": warnings,
+            "evidence": c_ev,
+            "source": "Extracted from uploaded document",
+            "is_ambiguous": is_ambiguous,
+            "ambiguity_reason": amb_msg,
+        }
+
+    if cgpa_cand:
+        c_val, c_scale, c_ev = cgpa_cand
+        return {
+            "val": c_val,
+            "scale": c_scale,
+            "warnings": warnings,
+            "evidence": c_ev,
+            "source": "Extracted from uploaded document",
+            "is_ambiguous": False,
+            "ambiguity_reason": None,
+        }
+
+    if pct_cand:
+        p_val, p_scale, p_ev = pct_cand
+        return {
+            "val": p_val,
+            "scale": p_scale,
+            "warnings": warnings,
+            "evidence": p_ev,
+            "source": "Extracted from uploaded document",
+            "is_ambiguous": False,
+            "ambiguity_reason": None,
+        }
+
+    # Standalone number labeled as grade (e.g. "Grade: 76", "Aggregate: 76")
+    bare_grade_pattern = r"(?i)\b(?:Grade|Marks|Aggregate|Score)\s*[:=\-]\s*([0-9]+(?:\.[0-9]+)?)\b"
+    match_bare = re.search(bare_grade_pattern, text)
+    if match_bare:
+        try:
+            b_val = float(match_bare.group(1))
+            amb_msg = f"Grade value '{b_val}' detected without scale or percentage symbol. Confirmation required."
+            warnings.append(amb_msg)
+            return {
+                "val": b_val,
+                "scale": None,
+                "warnings": warnings,
+                "evidence": match_bare.group(0).strip(),
+                "source": "Extracted from uploaded document",
+                "is_ambiguous": True,
+                "ambiguity_reason": amb_msg,
+            }
+        except ValueError:
+            pass
+
+    return {
+        "val": None,
+        "scale": None,
+        "warnings": warnings,
+        "evidence": None,
+        "source": None,
+        "is_ambiguous": False,
+        "ambiguity_reason": None,
+    }
+
+
 def extract_cgpa_and_scale(text: str) -> Tuple[Optional[float], Optional[float], List[str]]:
     """Extract CGPA and grading scale with strict validation.
 
     Safeguard: Never guesses or invents a scale (e.g. 4.0 or 10.0). If CGPA is found
-    without an explicit scale, the CGPA is omitted and a warning is logged.
+    without an explicit scale, the CGPA is preserved with scale=None and a warning is logged.
     """
-    warnings: List[str] = []
-
-    # Pattern A: Explicit scale (e.g. "CGPA: 3.85/4.0", "GPA of 8.5 out of 10.0", "CGPA 9.2 / 10")
-    scale_pattern = (
-        r"(?i)\b(?:CGPA|GPA|Grade Point Average|Cumulative GPA)\s*[:=\-]?\s*"
-        r"([0-9]+(?:\.[0-9]+)?)\s*(?:\/|\bout of\b)\s*([0-9]+(?:\.[0-9]+)?)"
-    )
-    match_with_scale = re.search(scale_pattern, text)
-    if match_with_scale:
-        try:
-            val = float(match_with_scale.group(1))
-            scale = float(match_with_scale.group(2))
-            if scale <= 0:
-                warnings.append(f"Invalid non-positive CGPA scale ({scale}) found; omitted.")
-                return None, None, warnings
-            if val > scale:
-                warnings.append(f"CGPA ({val}) cannot exceed grading scale ({scale}); omitted.")
-                return None, None, warnings
-            return val, scale, warnings
-        except ValueError:
-            pass
-
-    # Pattern B: Unscaled GPA (e.g. "GPA: 3.8", "CGPA: 8.9")
-    unscaled_pattern = (
-        r"(?i)\b(?:CGPA|GPA|Grade Point Average|Cumulative GPA)\s*[:=\-]?\s*"
-        r"([0-9]+(?:\.[0-9]+)?)(?!\s*(?:\/|\bout of\b))"
-    )
-    match_unscaled = re.search(unscaled_pattern, text)
-    if match_unscaled:
-        val_str = match_unscaled.group(1)
-        warnings.append(
-            f"CGPA value '{val_str}' was detected without an explicit grading scale. "
-            "CGPA omitted to prevent assumptions or miscalibration across international systems."
-        )
-
-    return None, None, warnings
+    res = extract_cgpa_and_scale_detailed(text)
+    return res["val"], res["scale"], res["warnings"]
 
 
 def extract_standardized_tests(text: str) -> Tuple[
@@ -352,11 +478,13 @@ def extract_student_profile(
     preferred_countries: Optional[List[str]] = None,
     github_url: Optional[str] = None,
     document_warnings: Optional[List[str]] = None,
+    user_overrides: Optional[Dict[str, Any]] = None,
 ) -> StudentProfile:
     """Execute the Student Profile Agent (SPA) to construct a validated StudentProfile.
 
     Orchestrates deterministic parsing across contact information, academic records,
     standardized tests, experience, skills with confidence grading, and GitHub metadata.
+    User overrides, if provided, take precedence over extracted document values.
     """
     warnings: List[str] = list(document_warnings or [])
     errors: List[str] = []
@@ -368,6 +496,7 @@ def extract_student_profile(
     name = extract_name(document_text)
     email = extract_email(document_text)
     current_degree = extract_degree_title(document_text)
+    nationality = None
 
     # 2. CGPA and Scale
     cgpa, cgpa_scale, cgpa_warnings = extract_cgpa_and_scale(document_text)
@@ -404,6 +533,31 @@ def extract_student_profile(
         github_repos = repos
         warnings.extend(gh_warnings)
 
+    # Apply explicit user-verified overrides
+    if user_overrides:
+        if "name" in user_overrides and user_overrides["name"] is not None:
+            name = user_overrides["name"]
+        if "email" in user_overrides and user_overrides["email"] is not None:
+            email = user_overrides["email"]
+        if "nationality" in user_overrides and user_overrides["nationality"] is not None:
+            nationality = user_overrides["nationality"]
+        if "current_degree" in user_overrides and user_overrides["current_degree"] is not None:
+            current_degree = user_overrides["current_degree"]
+        if "cgpa" in user_overrides:
+            cgpa = user_overrides["cgpa"]
+        if "cgpa_scale" in user_overrides:
+            cgpa_scale = user_overrides["cgpa_scale"]
+        if "ielts_score" in user_overrides:
+            ielts = user_overrides["ielts_score"]
+        if "toefl_score" in user_overrides:
+            toefl = user_overrides["toefl_score"]
+        if "gre_score" in user_overrides:
+            gre = user_overrides["gre_score"]
+        if "gmat_score" in user_overrides:
+            gmat = user_overrides["gmat_score"]
+        if "work_experience_years" in user_overrides:
+            work_exp = user_overrides["work_experience_years"]
+
     # Clean preferred countries
     countries = [c.strip() for c in (preferred_countries or []) if c.strip()]
 
@@ -411,7 +565,7 @@ def extract_student_profile(
         session_id=session_id,
         name=name,
         email=email,
-        nationality=None,  # Preserved as None unless verified
+        nationality=nationality,
         current_degree=current_degree,
         cgpa=cgpa,
         cgpa_scale=cgpa_scale,
