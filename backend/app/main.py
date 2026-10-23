@@ -7,6 +7,7 @@ and incremental pipeline event polling.
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
+import os
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import uuid
 
@@ -183,14 +184,26 @@ app = FastAPI(
 # Enforce streaming request size limit before routing/body parsing
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=DEFAULT_MAX_UPLOAD_BYTES)
 
-# CORS configuration for development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS configuration supporting environment origins, local dev, and Vercel domains
+_env_origins = os.getenv("ALLOWED_ORIGINS", "*")
+if _env_origins.strip() == "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    _allowed_origins = [o.strip() for o in _env_origins.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ============================================================================

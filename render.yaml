@@ -1,0 +1,36 @@
+# Render Blueprint Specification for ScholarSwarm AI
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: scholarswarm-backend
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: APP_ENV
+        value: production
+      - key: SEARCH_PROVIDER
+        value: tavily
+      - key: SEARCH_API_KEY
+        sync: false  # Configure your Tavily API key securely in the Render Dashboard
+      - key: ALLOWED_ORIGINS
+        value: "*"   # Wildcard or comma-separated list including your Vercel URL
+      - key: DATABASE_PATH
+        value: scholarswarm.db
+    # Note on Persistence Tradeoff:
+    # On Render Free Tier, SQLite database runs in the container filesystem (ephemeral storage),
+    # meaning sessions reset across container spin-downs or redeployments.
+    # To retain sessions permanently across deploys on a paid Starter plan ($7/mo),
+    # attach a persistent disk by uncommenting the block below:
+    # disk:
+    #   name: scholarswarm-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # and update DATABASE_PATH to: /var/data/scholarswarm.db
